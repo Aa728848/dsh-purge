@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { injectionPolicy, withoutPurgeInjection, isPurgeSection, requestInjectionContext } from '../lib/preset-injection.js';
-import { registerPromptSections, rewriteLiveAssembly, installHungPromptGlobal } from '../lib/index.js';
+import { registerPromptSections, rewriteLiveAssembly, installHungPromptGlobal, installIdentityOverride } from '../lib/index.js';
 import { ALL_PATCHES, applyReplacementsToText } from '../lib/core.js';
 import { writeTuning } from '../lib/tuning.js';
 import { createProbe } from '../lib/probe.js';
@@ -62,14 +62,58 @@ for (const position of ['head','tail','both']) test(`${position}: every register
   for(const id of ['roleplay','standard','minimal','standard']) {
     const values=specs.map(s=>s.text(context(id)));
     if(id==='standard') {
-      assert(values.filter(Boolean).length>=5);
+      assert(values.filter(Boolean).length>=4);
       const assembled={...original(),sections: [...original().sections,...specs.map(s=>({name:s.name,text:s.text(context(id))}))]};
       const result=rewriteLiveAssembly(config,assembled,context(id));
-      for(const name of ['dsh-purge-boost','dsh-purge:post','dsh-purge:probe'])assert(result.sections.some(s=>s.name===name&&s.text),name);
+      for(const name of ['dsh-purge-boost','dsh-purge:post'])assert(result.sections.some(s=>s.name===name&&s.text),name);
+      assert(result.sections.some(s=>s.name==='dsh-purge:probe'&&s.text===''),'probe placeholder never changes system text');
       const baseline=rewriteLiveAssembly({...config,excludePresets:[]},assembled,context(id));
       assert.deepEqual(JSON.parse(JSON.stringify(result)),JSON.parse(JSON.stringify(baseline)), 'unexcluded presets keep existing assembled behavior');
     }
     else assert(values.every(s=>s===''));
+  }
+}));
+
+test('probe lifecycle leaves cache-protected system sections byte-stable', () => isolated(home => {
+  writeTuning({injectPosition:'head'},home);
+  const specs=[];registerPromptSections({systemPrompt:{section:s=>specs.push(s)}},config);
+  const protectedAssembly=()=>({...original(),sections:[
+    ...original().sections,
+    {name:'tools:sdk',text:'FROZEN SDK DECLARATIONS'},
+    {name:'timeline:planning',text:'FROZEN TIMELINE POLICY'},
+    ...specs.map(s=>({name:s.name,text:s.text(context('standard'))})),
+  ]});
+  const rendered=()=>rewriteLiveAssembly(config,protectedAssembly(),context('standard')).sections
+    .map(s=>({name:s.name,text:s.text}));
+  const before=rendered();
+  const created=createProbe(home);
+  assert.deepEqual(rendered(),before,'creating a probe must not alter the protected system prefix');
+  const file=path.join(home,'dsh-purge','probe.json');
+  fs.writeFileSync(file,JSON.stringify({nonce:created.nonce,at:Date.now()-31*60*1000}));
+  assert.deepEqual(rendered(),before,'probe expiry must not alter the protected system prefix');
+}));
+
+test('installed pre-step hook appends the probe after downstream cache notices', () => isolated(async home => {
+  const created=createProbe(home);
+  const handlers=[];const cleanups=[];
+  const ctx={
+    systemPrompt:{assemble:async()=>original()},
+    on(name,fn){handlers.push({name,fn});return()=>{};},
+    effect(fn){const dispose=fn();if(typeof dispose==='function')cleanups.push(dispose);},
+  };
+  installIdentityOverride(ctx,{...config,excludePresets:[]});
+  try {
+    const hook=handlers.filter(h=>h.name==='agent/pre-step').at(-1);
+    assert(hook,'probe delivery uses the installed pre-step hook');
+    const downstream={kind:'continue',messages:[{id:'foreign-cache-notice',role:'user',content:[]}]};
+    const session={header:{agentPreset:'standard'}};
+    const result=await hook.fn({agent:{session}},async()=>downstream);
+    assert.equal(result.messages[0],downstream.messages[0]);
+    assert(result.messages[1].content[0].text.includes(created.nonce));
+    const repeated=await hook.fn({agent:{session}},async()=>downstream);
+    assert.strictEqual(repeated,downstream);
+  } finally {
+    for(const dispose of cleanups.reverse())dispose();
   }
 }));
 
